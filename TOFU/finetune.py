@@ -51,6 +51,9 @@ def main(cfg):
     model_cfg = get_model_identifiers_from_yaml(cfg.model_family)
     model_id = model_cfg["hf_key"]
 
+    # Prefer local model_path if provided (e.g., Meta-Llama-3.1-8B-Instruct on server)
+    load_id = getattr(cfg, "model_path", None) or model_id
+
     Path(cfg.save_dir).mkdir(parents=True, exist_ok=True) # save the cfg file
     
     #if master process
@@ -58,8 +61,10 @@ def main(cfg):
         with open(f'{cfg.save_dir}/cfg.yaml', 'w') as f:
             OmegaConf.save(cfg, f)
 
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    tokenizer = AutoTokenizer.from_pretrained(load_id, trust_remote_code=True)
+    tokenizer.padding_side = "right"
     tokenizer.pad_token = tokenizer.eos_token
+    
 
     max_length = 500
     torch_format_dataset = TextDatasetQA(cfg.data_path, tokenizer=tokenizer, model_family = cfg.model_family, max_length=max_length, split=cfg.split)
@@ -93,22 +98,29 @@ def main(cfg):
             logging_steps=max(1,max_steps//20),
             logging_dir=f'{cfg.save_dir}/logs',
             output_dir=cfg.save_dir,
-            optim="paged_adamw_32bit",
+            # optim="paged_adamw_32bit",
+            optim="adamw_torch",
             save_steps=steps_per_epoch,
             save_only_model=True,
             ddp_find_unused_parameters= False,
-            evaluation_strategy="no",
-            deepspeed='config/ds_config.json',
+            # evaluation_strategy="no",
+            deepspeed='config/ds_zero2_bf16.json',
             weight_decay = cfg.weight_decay
         )
 
-    model = AutoModelForCausalLM.from_pretrained(model_id, 
-                                                 use_flash_attention_2=model_cfg["flash_attention2"]=="true", 
-                                                 torch_dtype=torch.bfloat16, 
-                                                 trust_remote_code = True)
+    attn_impl = "flash_attention_2" if model_cfg.get("flash_attention2", "true") == "true" else None
+    model = AutoModelForCausalLM.from_pretrained(
+        load_id,
+        attn_implementation=attn_impl,
+        torch_dtype=torch.bfloat16,
+        trust_remote_code=True,
+        low_cpu_mem_usage=True,
+    )
     model.generation_config.do_sample = True
     
-    if model_cfg["gradient_checkpointing"] == "true": 
+    # Allow overriding gradient checkpointing from config; else fallback to model_cfg
+    grad_ckpt_cfg = getattr(cfg, "gradient_checkpointing", None)
+    if grad_ckpt_cfg is True or (grad_ckpt_cfg is None and model_cfg.get("gradient_checkpointing", "true") == "true"):
         model.gradient_checkpointing_enable()
     
     config = LoraConfig(
@@ -130,6 +142,10 @@ def main(cfg):
         args=training_args,
         data_collator=custom_data_collator,
     )
+    print("deepspeed arg:", training_args.deepspeed)
+    print("is_deepspeed_enabled:", trainer.is_deepspeed_enabled)
+
+
     model.config.use_cache = False  # silence the warnings. Please re-enable for inference!
 
     print(f'Start training: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}.')

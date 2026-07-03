@@ -1,17 +1,21 @@
-model_family: llama2-7b
+model_family: llama3.1-8b  # 若未在映射中添加 llama3-8b，先保持此值，实际会用 model_path 覆盖
+
+# 本地模型路径（优先于 model_family/hf_key）
+# 示例：服务器共享目录中的 Llama 3.1 8B Instruct
+model_path: /home/share/models/Meta-Llama-3.1-8B-Instruct
 
 LoRA:
-  r: 0
+  r: 0  # 建议先用 LoRA 以降低显存需求；全参可改回 0
   alpha: 32
   dropout: 0.05
 
-data_path: locuslab/TOFU
+data_path: /home/zkzhang/unlearning/Unlearn-Simple/TOFU/TOFU_data
 split: full
 batch_size: 1
-gradient_accumulation_steps: 4
+gradient_accumulation_steps: 32  # 维持有效 batch，降低显存峰值
 num_epochs: 5
 lr: 1e-5
 seed: 42
 run_index: 1
-save_dir: paper_models/final_ft_noLORA_5_epochs_inst_lr${lr}_${model_family}_${split}_seed${seed}_${run_index}
+save_dir: paper_models/ft_llama3.1-8b_TOFU_${split}_lr${lr}_seed${seed}_${run_index}
 weight_decay: 0.01

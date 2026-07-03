@@ -9,9 +9,15 @@ from utils import get_model_identifiers_from_yaml
 def convert_raw_data_to_model_format(tokenizer, max_length,  question, answer, model_configs):
     question_start_token, question_end_token, answer_token = model_configs['question_start_tag'], model_configs['question_end_tag'], model_configs['answer_tag']
     new_question = question_start_token + question + question_end_token
-    new_answer = answer_token + answer
+    # new_answer = answer_token + answer
+    new_answer = f"{answer_token}{answer}<|eot_id|>"
     full_text = new_question + new_answer
-    num_question_tokens = len(tokenizer.tokenize(new_question, add_special_tokens=True))
+    #llama2-7b
+    # num_question_tokens = len(tokenizer.tokenize(new_question, add_special_tokens=True))
+    #llama3.1-8b
+    num_question_tokens = len(
+        tokenizer(new_question, add_special_tokens=True, truncation=True, max_length=max_length).input_ids
+    )
 
     encoded = tokenizer(
         full_text, 

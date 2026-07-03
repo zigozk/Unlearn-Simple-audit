@@ -62,13 +62,25 @@ def interleave(a, b, size):
         c.extend(a[i:i+size])
         c.extend(b[i:i+size])
     return c
-
+# def interleave(a, b, bsz):
+#     out = []
+#     ia = ib = 0
+#     while ia < len(a) or ib < len(b):
+#         if ia < len(a):
+#             out.extend(a[ia:ia+bsz])
+#             ia += bsz
+#         if ib < len(b):
+#             out.extend(b[ib:ib+bsz])
+#             ib += bsz
+#     return out
 # PLEASE BE VERY VERY CAREFUL HERE
 # This code, although takes num_processes as an argument, it in fact only supports num_processes=2
 # Future improvement should support interleave for more than 2 processes
 # also, small_bsz = large_bsz//4 is hardcoded, which is only true for our experiments
 # because when we construct perturb and paraphrase data_loader, we set batch_size=large_bsz//4 specifically 
 def interleave_eval_result_dict(eval_result_dict, forget_rate, large_bsz, num_processes=2):
+    if num_processes <= 1:
+        return eval_result_dict
     small_bsz = large_bsz//4
     for k, v in eval_result_dict.items():
         # each v corresponds to one ckpt

@@ -1,5 +1,6 @@
 .DS_Store
-
+*.err
+*.out
 
 TOFU/commands/
 TOFU/outputs/
@@ -36,3 +37,22 @@ plot/figures/
 plot/
 plot/figures/
 # *.sh
+# local heavy artifacts
+TOFU/unlearned/
+TOFU/SimNPO-TOFU-forget05-Llama-2-7b-chat/
+TOFU/tmp*/
+TOFU/outputs/
+TOFU/paper_models/
+old_project_fq_audit.tgz
+
+# model/checkpoint/cache files
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.ckpt
+*.gguf
+*.arrow
+*.cache
+__pycache__/
+*.pyc

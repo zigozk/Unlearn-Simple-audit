@@ -26,7 +26,7 @@ import tqdm
 
 
 class CustomTrainer(Trainer):
-    def compute_loss(self, model, inputs, return_outputs=False):
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None, **kwargs):
         input_ids, labels, attention_mask = inputs
         outputs = model(input_ids,labels=labels, attention_mask=attention_mask)
         loss = outputs.loss
@@ -108,7 +108,22 @@ class CustomTrainerForgetting(Trainer):
 
     def e_prepare_deepspeed(self, model):
         # Adapted from accelerate: https://github.com/huggingface/accelerate/blob/739b135f8367becb67ffaada12fe76e3aa60fefd/src/accelerate/accelerator.py#L1473
+        if model is None:
+            return None
+
         deepspeed_plugin = self.accelerator.state.deepspeed_plugin
+        if deepspeed_plugin is None:
+            # DeepSpeed is disabled; keep oracle model as a plain torch module.
+            model.eval()
+            for param in model.parameters():
+                param.requires_grad = False
+            try:
+                model.to(self.accelerator.device)
+            except Exception:
+                # If the model is already placed/sharded by a device_map, skip moving.
+                pass
+            return model
+
         config_kwargs = copy.deepcopy(deepspeed_plugin.deepspeed_config)
 
         if model is not None:
@@ -125,7 +140,7 @@ class CustomTrainerForgetting(Trainer):
                         {
                             "zero_optimization.reduce_bucket_size": hidden_size * hidden_size,
                             "zero_optimization.stage3_param_persistence_threshold": 10 * hidden_size,
-                            "zero_optimization.stage3_prefetch_bucket_size": 0.9 * hidden_size * hidden_size,
+                            "zero_optimization.stage3_prefetch_bucket_size": int(0.9 * hidden_size * hidden_size),
                         }
                     )
 
@@ -145,7 +160,7 @@ class CustomTrainerForgetting(Trainer):
 
         return model
     
-    def compute_loss(self, model, inputs, return_outputs=False):
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None, **kwargs):
         if self.loss_type == "grad_ascent":
             forget_inputs, retain_inputs = inputs
             input_ids, labels, attention_mask = forget_inputs
@@ -450,8 +465,15 @@ class CustomTrainerForgetting(Trainer):
         args = self.args
         model = self._wrap_model(self.model, training=False, dataloader=None)
 
+        try:
+            base_model = self.accelerator.unwrap_model(model)
+        except Exception:
+            base_model = getattr(model, "module", model)
+
+        model_dtype = next(base_model.parameters()).dtype
+
         print('####### Evaluating the model...... #######')
-        print(self.is_in_train, args.device, model.dtype, self.args.dataloader_num_workers, self.eval_cfg.split_list)
+        print(self.is_in_train, args.device, model_dtype, self.args.dataloader_num_workers, self.eval_cfg.split_list)
 
         if len(self.accelerator._models) == 0 and model is self.model:
             model = (
@@ -486,7 +508,7 @@ class CustomTrainerForgetting(Trainer):
         curr_save_dir = os.path.join(eval_cfg.save_dir, f"checkpoint-{curr_step}")
         Path(curr_save_dir).mkdir(parents=True, exist_ok=True)
 
-        forget_rate = eval_cfg.split_list[-1].split('_')[0]
+        forget_rate = str(eval_cfg.split).split('_')[0]
 
         with torch.no_grad():
             for i, (folder, split, question_key, answer_key, eval_task, base_answer_key, perturbed_answer_key) in enumerate(zip(eval_cfg.data_path, eval_cfg.split_list, eval_cfg.question_key, eval_cfg.answer_key, eval_cfg.eval_task, eval_cfg.base_answer_key, eval_cfg.perturbed_answer_key)):
@@ -516,7 +538,8 @@ class CustomTrainerForgetting(Trainer):
 
                 eval_logs = get_all_evals(eval_cfg, model, self.tokenizer, eval_task, eval_dataloader, base_eval_dataloader, perturb_dataloader)
                 
-                kl_divergence_log = get_kl_divergence(model, self.oracle_model, eval_dataloader)
+                kl_divergence_log = get_kl_divergence(self.eval_cfg, self.tokenizer, model, self.oracle_model, eval_dataloader)
+
                 eval_logs['kl_divergence'] = kl_divergence_log
 
                 with open(save_filename, "w") as f:
@@ -614,7 +637,7 @@ class CustomTrainerRetraining(Trainer):
             dataloader_params["worker_init_fn"] = seed_worker
         return self.accelerator.prepare(DataLoader(train_dataset, **dataloader_params))
 
-    def compute_loss(self, model, inputs, return_outputs=False):
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None, **kwargs):
         input_ids, labels, attention_mask = inputs
         outputs = model(input_ids,labels=labels, attention_mask=attention_mask)
         loss = outputs.loss
@@ -675,13 +698,14 @@ class CustomTrainerRetraining(Trainer):
         curr_save_dir = os.path.join(eval_cfg.save_dir, f"checkpoint-{curr_step}")
         Path(curr_save_dir).mkdir(parents=True, exist_ok=True)
 
-        forget_rate = eval_cfg.split.split('_')[0]
+        forget_rate = str(eval_cfg.split).split('_')[0]
 
         with torch.no_grad():
             for i, (folder, split, question_key, answer_key, eval_task, base_answer_key, perturbed_answer_key) in enumerate(zip(eval_cfg.data_path, eval_cfg.split_list, eval_cfg.question_key, eval_cfg.answer_key, eval_cfg.eval_task, eval_cfg.base_answer_key, eval_cfg.perturbed_answer_key)):
 
                 world_size = self.accelerator.num_processes
-
+                if (not torch.distributed.is_available()) or (not torch.distributed.is_initialized()):
+                    world_size = 1
                 # For some reason, Hydra is not interprating the split correctly
                 if eval_task == 'eval_log_forget':
                     split = eval_cfg.split

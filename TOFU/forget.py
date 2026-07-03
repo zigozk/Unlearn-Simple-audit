@@ -8,6 +8,7 @@ import os
 from peft import LoraConfig, get_peft_model, PeftModel
 from pathlib import Path
 from utils import get_model_identifiers_from_yaml, set_random_seed
+import inspect
 
 def find_all_linear_names(model):
     cls = torch.nn.Linear
@@ -43,10 +44,11 @@ def main(cfg):
 
     num_devices = int(os.environ.get('WORLD_SIZE', 1))
     print(f"num_devices: {num_devices}")
-
-    if os.environ.get('LOCAL_RANK') is not None:
-        local_rank = int(os.environ.get('LOCAL_RANK', '0'))
-        device_map = {'': local_rank}
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    device_map = {"": local_rank}
+    # if os.environ.get('LOCAL_RANK') is not None:
+    #     local_rank = int(os.environ.get('LOCAL_RANK', '0'))
+    #     device_map = {'': local_rank}
 
     os.environ["WANDB_DISABLED"] = "true"
     model_cfg = get_model_identifiers_from_yaml(cfg.model_family)
@@ -55,8 +57,12 @@ def main(cfg):
         cfg.model_path = model_cfg["ft_model_path"]
 
 
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    # tokenizer = AutoTokenizer.from_pretrained(model_id)
+    print(f"Loading tokenizer from local path: {cfg.model_path}")
+    tokenizer = AutoTokenizer.from_pretrained(cfg.model_path, use_fast=False, trust_remote_code=True)
     tokenizer.pad_token = tokenizer.eos_token
+    #llama3.1-8b
+    tokenizer.padding_side = "right"
 
     print("######################")
     print("Saving to: ", cfg.save_dir)
@@ -66,7 +72,7 @@ def main(cfg):
 
     # determine the data path.
     if cfg.split in ['forget01','forget05','forget10']:
-        data_path = 'locuslab/TOFU'
+        data_path = './TOFU_data'
     elif cfg.split in ['forget20','forget35','forget50','forget90']:
         data_path = './TOFU_data'
     else:
@@ -116,28 +122,55 @@ def main(cfg):
         raise NotImplementedError("The warmup_steps must be an integer or step_per_epoch.")
 
     print(f"steps_per_epoch: {steps_per_epoch}, eval_steps: {eval_steps}, warmup_steps: {warmup_steps}")
-    training_args = transformers.TrainingArguments(
-            per_device_train_batch_size=batch_size,
-            per_device_eval_batch_size=batch_size,
-            gradient_accumulation_steps=gradient_accumulation_steps,
-            warmup_steps=warmup_steps,
-            max_steps=max_steps,
-            learning_rate=cfg.lr,
-            bf16=True,
-            bf16_full_eval=True,
-            logging_steps=max_steps+1, # do not save the model
-            logging_dir=f'{cfg.save_dir}/logs',
-            output_dir=cfg.save_dir,
-            optim="paged_adamw_32bit",
-            save_steps=max_steps+1, # do not save the model
-            ddp_find_unused_parameters= False,
-            deepspeed='config/ds_config.json',
-            weight_decay = cfg.weight_decay,
-            # evaluation_strategy = "steps",
-            # eval_steps = eval_steps,
-            evaluation_strategy="no"
+    # training_args = transformers.TrainingArguments(
+    #         per_device_train_batch_size=batch_size,
+    #         per_device_eval_batch_size=batch_size,
+    #         gradient_accumulation_steps=gradient_accumulation_steps,
+    #         warmup_steps=warmup_steps,
+    #         max_steps=max_steps,
+    #         learning_rate=cfg.lr,
+    #         bf16=True,
+    #         bf16_full_eval=True,
+    #         logging_steps=max_steps+1, # do not save the model
+    #         logging_dir=f'{cfg.save_dir}/logs',
+    #         output_dir=cfg.save_dir,
+    #         optim="paged_adamw_32bit",
+    #         save_steps=max_steps+1, # do not save the model
+    #         ddp_find_unused_parameters= False,
+    #         # deepspeed='config/ds_config.json',
+    #         weight_decay = cfg.weight_decay,
+    #         # evaluation_strategy = "steps",
+    #         # eval_steps = eval_steps,
+    #         # evaluation_strategy="no"  旧版transformers叫法，新版叫eval_strategy
+    #         eval_strategy="no"
+    # )
+    ta_sig = inspect.signature(transformers.TrainingArguments.__init__)
+
+    kwargs = dict(
+        per_device_train_batch_size=batch_size,
+        per_device_eval_batch_size=batch_size,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        warmup_steps=warmup_steps,
+        max_steps=max_steps,
+        learning_rate=cfg.lr,
+        bf16=True,
+        bf16_full_eval=True,
+        logging_steps=max_steps+1,
+        logging_dir=f'{cfg.save_dir}/logs',
+        output_dir=cfg.save_dir,
+        optim="paged_adamw_32bit",
+        save_steps=max_steps+1,
+        ddp_find_unused_parameters=False,
+        weight_decay=cfg.weight_decay,
     )
-    
+
+    if "eval_strategy" in ta_sig.parameters:
+        kwargs["eval_strategy"] = "no"
+    else:
+        kwargs["evaluation_strategy"] = "no"
+
+    training_args = transformers.TrainingArguments(**kwargs)
+
     #first get the base model architectur2e
     #if there is a pytorch*.bin file in the model path, then load that. use regex there can be anythign in between pytorch and .bin
     import re
@@ -155,12 +188,25 @@ def main(cfg):
 
     if path_found:
         print("Loading from checkpoint")
-        model = AutoModelForCausalLM.from_pretrained(cfg.model_path, use_flash_attention_2=model_cfg["flash_attention2"]=="true", torch_dtype=torch.bfloat16, trust_remote_code = True)
-        oracle_model = AutoModelForCausalLM.from_pretrained(cfg.model_path, use_flash_attention_2=model_cfg["flash_attention2"]=="true", torch_dtype=torch.bfloat16, trust_remote_code = True)
+        model = AutoModelForCausalLM.from_pretrained(cfg.model_path, 
+            # attn_implementation="flash_attention_2",
+            attn_implementation="sdpa",
+            torch_dtype=torch.bfloat16, 
+            trust_remote_code = True,
+            low_cpu_mem_usage=True)
+        oracle_model = AutoModelForCausalLM.from_pretrained(cfg.model_path, 
+            # attn_implementation="flash_attention_2",
+            attn_implementation="sdpa",
+            torch_dtype=torch.bfloat16, 
+            trust_remote_code = True,
+            low_cpu_mem_usage=True)
 
     else:
         print("Loading after merge and unload")
-        model = AutoModelForCausalLM.from_pretrained(model_id, use_flash_attention_2=model_cfg["flash_attention2"]=="true", torch_dtype=torch.bfloat16, device_map=device_map)
+        model = AutoModelForCausalLM.from_pretrained(model_id, 
+            # attn_implementation="flash_attention_2",
+            attn_implementation="sdpa",
+            torch_dtype=torch.bfloat16, device_map=device_map)
         #now use the checkpoint to add the LoRA modules
         model = PeftModel.from_pretrained(model, model_id = cfg.model_path)
         #save this as a standard model so that we can again do PEFT style finetuneing from scratch
@@ -173,7 +219,12 @@ def main(cfg):
 
     #now we have a HuggingFace model 
     if model_cfg["gradient_checkpointing"] == "true":
-        model.gradient_checkpointing_enable()
+        try:
+            model.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False}
+            )
+        except TypeError:
+            model.gradient_checkpointing_enable()
     config = LoraConfig(
         r=cfg.LoRA.r, 
         lora_alpha=cfg.LoRA.alpha, 
@@ -190,7 +241,7 @@ def main(cfg):
     if cfg.split in ['forget01','forget05','forget10']:
         pass
     elif cfg.split in ['forget20','forget35','forget50','forget90']:
-        cfg.eval.data_path = ['locuslab/TOFU', 'locuslab/TOFU', 'locuslab/TOFU', './TOFU_data']
+        cfg.eval.data_path = ['./TOFU_data', './TOFU_data', './TOFU_data', './TOFU_data']
         cfg.eval.split = 'forget10_perturbed' # we use the commonly available forget10 to evaluate the truth ratio on the forget set when we do forget20 - forget90.
         cfg.eval.split_list = ['retain_perturbed', 'real_authors_perturbed', 'world_facts_perturbed', 'forget10_perturbed']
     else:
@@ -218,6 +269,8 @@ def main(cfg):
     )
     model.config.use_cache = False  # silence the warnings. Please re-enable for inference!
     trainer.train()
+    
+    model.config.use_cache = True
     trainer.evaluate()
 
     #save the tokenizer

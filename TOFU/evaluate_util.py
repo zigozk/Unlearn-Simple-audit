@@ -11,9 +11,18 @@ from pathlib import Path
 from rouge_score import rouge_scorer
 from utils import get_model_identifiers_from_yaml
 import torch.nn as nn
+def unwrap_model(m):
+    # DataParallel / DDP / DeepSpeedEngine 都常见有 .module
+    return m.module if hasattr(m, "module") else m
+
+def get_model_device(m):
+    m = unwrap_model(m)
+    return next(m.parameters()).device
 
 def eval_perturbation_ratio(eval_dataloader, perturb_dataloader, model):
     eval_logs = {}
+    base_model = unwrap_model(model)
+    device = get_model_device(model)
     for batch, perturb_batch in tqdm(zip(eval_dataloader, perturb_dataloader)):
         input_ids, labels, attention_mask = batch
         batch = {"input_ids": input_ids, "labels": labels, "attention_mask": attention_mask}
@@ -28,9 +37,9 @@ def eval_perturbation_ratio(eval_dataloader, perturb_dataloader, model):
 
         #send to device
         for k, v in batch.items():
-            batch[k] = v.to(model.device)
+            batch[k] = v.to(device)
         for k, v in perturb_batch.items():
-            perturb_batch[k] = v.to(model.device)
+            perturb_batch[k] = v.to(device)
 
 
         with torch.no_grad():
@@ -119,16 +128,18 @@ def get_all_evals(cfg, model, tokenizer, eval_task, eval_dataloader, base_eval_d
     gen_outputs = []
     ground_truths = []
     input_strings = []
+    base_model = unwrap_model(model)
+    device = get_model_device(model)
     for batch in tqdm(eval_dataloader):
         input_ids, labels, attention_mask = batch
         batch = {"input_ids": input_ids, "labels": labels, "attention_mask": attention_mask}
         #send to device
         for k, v in batch.items():
-            batch[k] = v.to(model.device)
+            batch[k] = v.to(device)
 
         with torch.no_grad():
-            outputs = model(**batch)
-            input_string, gen_output, gt = run_generation(cfg, batch, model, tokenizer=tokenizer)
+            outputs = model(**batch)  # forward 用 wrapper 也行
+            input_string, gen_output, gt = run_generation(cfg, batch, base_model, tokenizer=tokenizer)
             gen_outputs.extend(gen_output)
             ground_truths.extend(gt)
             input_strings.extend(input_string)
@@ -147,28 +158,42 @@ def get_all_evals(cfg, model, tokenizer, eval_task, eval_dataloader, base_eval_d
     eval_logs['generated_text'] = list(zip(input_strings, gen_outputs,ground_truths))
     return eval_logs
 
-def get_kl_divergence(model, oracle_model, eval_dataloader):
-    '''
-    Compute the KL divergence of each task on the unlearned model and the oracle model (the fine-tuned model).
-    '''
-    
+def get_kl_divergence(cfg, tokenizer, model, oracle_model, eval_dataloader):
+    """
+    Compute KL divergence between model and oracle_model.
+    """
+    device = get_model_device(model)
+    model.eval()
+    oracle_model.eval()
+
+    # 确保 oracle_model 在同一 device（如果你本来就放好了，这行也安全）
+    oracle_model = oracle_model.to(device)
+
     kl_outputs = []
+    base_model = unwrap_model(model)
+
     for batch in tqdm(eval_dataloader):
         input_ids, labels, attention_mask = batch
         batch = {"input_ids": input_ids, "labels": labels, "attention_mask": attention_mask}
-        #send to device
+
         for k, v in batch.items():
-            batch[k] = v.to(model.device)
+            batch[k] = v.to(device)
 
         with torch.no_grad():
             outputs = model(**batch)
-            outputs_oracle_model = oracle_model(input_ids,labels=labels, attention_mask=attention_mask)
-            
-            probs = F.log_softmax(outputs.logits, dim=-1)
-            probs_oracle_model = F.log_softmax(outputs_oracle_model.logits, dim=-1)
-            kl_divergence = nn.functional.kl_div(probs, probs_oracle_model, reduction='none', log_target=True)
-            kl_outputs.extend(kl_divergence.sum(axis=2).mean(axis=1).cpu().numpy().tolist())
+            outputs_oracle_model = oracle_model(**batch)
+
+            # 如果你确实想在 KL 阶段也做 generation（会很慢），保留这行：
+            # input_string, gen_output, gt = run_generation(cfg, batch, base_model, tokenizer=tokenizer)
+
+            logp = F.log_softmax(outputs.logits, dim=-1)
+            logp_ref = F.log_softmax(outputs_oracle_model.logits, dim=-1)
+
+            kl = torch.nn.functional.kl_div(logp, logp_ref, reduction="none", log_target=True)
+            kl_outputs.extend(kl.sum(dim=2).mean(dim=1).cpu().numpy().tolist())
+
     return kl_outputs
+
 
 @hydra.main(version_base=None, config_path="config", config_name="eval_everything")
 def main(cfg):
@@ -249,46 +274,74 @@ def eval_accuracy(logits, labels):
 
     return {"eval accuracy": acc.item()}
 
+def decode_gt_from_labels(labels_row, tokenizer):
+    # labels_row: (seq_len,)
+    gt_ids = labels_row[labels_row != -100]
+    # 去掉 eos（以及可能的 eot）
+    if tokenizer.eos_token_id is not None:
+        gt_ids = gt_ids[gt_ids != tokenizer.eos_token_id]
+    # 解码时跳过特殊 token
+    gt = tokenizer.decode(gt_ids.tolist(), skip_special_tokens=True).strip()
+    return gt
 
 def run_generation(cfg, batch, model, tokenizer):
 
     input_ids = batch["input_ids"]
-    input_strings = tokenizer.batch_decode(input_ids, skip_special_tokens=True)
-    split_symbol = " [/INST]" if cfg.model_family == 'llama2-7b' else 'Answer: '
-    ground_truth = [s.split(split_symbol)[1] for s in input_strings]
-    input_strings = [s.split(split_symbol)[0] for s in input_strings]
-    #add ["/INST "] to the end of each string
-    if cfg.model_family == 'llama2-7b':
-        input_strings = [s + split_symbol for s in input_strings]
+    # 关键1：不要 skip_special_tokens=True（否则 chat 模型的边界 token 可能被吞）
+    input_strings = tokenizer.batch_decode(input_ids, skip_special_tokens=False)
+
+    model_cfg = get_model_identifiers_from_yaml(cfg.model_family)
+    split_symbol = model_cfg.get("answer_tag") or model_cfg.get("question_end_tag") or "Answer: "
+
+    labels = batch.get("labels", None)
+
+    prompts, gts = [], []
+    for i, s in enumerate(input_strings):
+        parts = s.split(split_symbol, 1)
+        if len(parts) == 2:
+            pre, post = parts
+            prompts.append(pre + split_symbol)
+        else:
+            prompts.append(s)
+
+        if labels is not None:
+            gts.append(decode_gt_from_labels(labels[i], tokenizer))
+        else:
+            # 兜底：如果没有 labels，就至少把 eot/eos 截断掉
+            gt = post.strip()
+            gt = gt.split("<|eot_id|>")[0].strip()
+            gts.append(gt)
+
         
     #we only want to retain the input before the [/INST] token. split each string to only retain the content before the [/INST] token
     # ground_truth = [s.split("[/INST] ")[1] for s in input_strings]
     # input_strings = [s.split("[/INST] ")[0] for s in input_strings]
     # #add ["/INST "] to the end of each string
     # input_strings = [s + "[/INST] " for s in input_strings]
-    
+    import copy
     #now tokenize the strings with left padding
-    left_pad_tokenizer = tokenizer
+    left_pad_tokenizer = copy.deepcopy(tokenizer)
     left_pad_tokenizer.padding_side = 'left'
-    left_pad_tokenizer.padding_size = 'longest'
     left_pad_tokenizer.pad_token = left_pad_tokenizer.eos_token
     left_pad_tokenizer.pad_token_id = left_pad_tokenizer.eos_token_id
 
-
-    inputs = left_pad_tokenizer.batch_encode_plus(input_strings, add_special_tokens=True, return_tensors='pt', padding=True).to(model.device)
-    
+    device = get_model_device(model)
+    inputs = left_pad_tokenizer.batch_encode_plus(prompts, add_special_tokens=True,
+                                              return_tensors='pt', padding=True).to(device)
+    max_new = cfg.generation.max_new_tokens if cfg.generation.max_new_tokens is not None else 64
     #now generate
     torch.manual_seed(0)
     out = model.generate(inputs.input_ids, 
                         attention_mask=inputs.attention_mask,
-                        max_length=cfg.generation.max_length, 
-                        max_new_tokens=cfg.generation.max_new_tokens, 
+                        # max_length=cfg.generation.max_length, 
+                        max_new_tokens=max_new, 
                         do_sample=True,
-                        use_cache=True, 
+                        # use_cache=True, 
+                        use_cache=model.config.use_cache,
                         pad_token_id=left_pad_tokenizer.eos_token_id)
     
     strs = left_pad_tokenizer.batch_decode(out[:, inputs.input_ids.shape[-1]:], skip_special_tokens=True)
-    return input_strings, strs, ground_truth
+    return prompts, strs, gts
 
 def eval_bleu(gen_outputs, ground_truths):
 
